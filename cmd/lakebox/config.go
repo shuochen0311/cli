@@ -19,13 +19,17 @@ const (
 func newConfigCommand() *cobra.Command {
 	var idleTimeoutFlag string
 	var noAutostopFlag bool
+	var nameFlag string
 
 	cmd := &cobra.Command{
 		Use:   "config <lakebox-id>",
-		Short: "Configure a Lakebox's auto-stop policy",
-		Long: `Configure a Lakebox's auto-stop policy.
+		Short: "Configure a Lakebox's name and auto-stop policy",
+		Long: `Configure a Lakebox's name and auto-stop policy.
 
-Two knobs are independent — pass either or both:
+Three knobs are independent — pass any combination:
+
+  --name <label>              Display label for the lakebox (max 256 bytes).
+                              Pass an empty string to clear.
 
   --idle-timeout <duration>   Per-sandbox idle timeout. The watchdog reaps
                               the sandbox after this much idle time. Pass
@@ -42,6 +46,7 @@ Two knobs are independent — pass either or both:
                               stops on explicit 'lakebox delete'.
 
 Examples:
+  lakebox config happy-panda-1234 --name my-project
   lakebox config happy-panda-1234 --idle-timeout 15m
   lakebox config happy-panda-1234 --idle-timeout 1h30m
   lakebox config happy-panda-1234 --idle-timeout 0           # clear, use default
@@ -75,23 +80,34 @@ Examples:
 				noAutostop = &p
 			}
 
-			if idleSecs == nil && noAutostop == nil {
-				return fmt.Errorf("nothing to update — pass --idle-timeout and/or --no-autostop")
+			var name *string
+			if cmd.Flags().Changed("name") {
+				n := nameFlag
+				name = &n
 			}
 
-			updated, err := api.update(ctx, id, idleSecs, noAutostop)
+			if idleSecs == nil && noAutostop == nil && name == nil {
+				return fmt.Errorf("nothing to update — pass --name, --idle-timeout, and/or --no-autostop")
+			}
+
+			updated, err := api.update(ctx, id, name, idleSecs, noAutostop)
 			if err != nil {
 				return fmt.Errorf("failed to update lakebox %s: %w", id, err)
 			}
 
 			blank(out)
 			field(out, "id", bold(updated.SandboxID))
+			if updated.Name != "" {
+				field(out, "name", updated.Name)
+			}
 			field(out, "autostop", dim(updated.autoStopLabel()))
 			blank(out)
 			return nil
 		},
 	}
 
+	cmd.Flags().StringVar(&nameFlag, "name", "",
+		"Display label for the lakebox (max 256 bytes). Pass --name= to clear.")
 	cmd.Flags().StringVar(&idleTimeoutFlag, "idle-timeout", "",
 		"Idle timeout (e.g. 15m, 1h30m, 90s). Pass 0 to clear and revert to the manager's default.")
 	cmd.Flags().BoolVar(&noAutostopFlag, "no-autostop", false,

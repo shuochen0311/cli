@@ -42,6 +42,9 @@ Example:
 			out := cmd.OutOrStdout()
 			blank(out)
 			field(out, "id", bold(entry.SandboxID))
+			if entry.Name != "" {
+				field(out, "name", entry.Name)
+			}
 			field(out, "status", status(entry.Status))
 			if entry.FQDN != "" {
 				field(out, "fqdn", dim(entry.FQDN))

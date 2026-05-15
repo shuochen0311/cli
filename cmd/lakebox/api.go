@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,15 +24,18 @@ type lakeboxAPI struct {
 	w *databricks.WorkspaceClient
 }
 
+// sandboxCreateBody is the inner `Sandbox` message in the create payload.
+// Only `name` is caller-settable today (see `LakeboxApi::create_sandbox` in
+// `lakebox/src/api/service.rs`); all other fields are server-chosen.
+type sandboxCreateBody struct {
+	Name string `json:"name,omitempty"`
+}
+
 // createRequest is the JSON body for POST /api/2.0/lakebox/sandboxes.
-//
-// The proto-defined `CreateSandboxRequest` carries a `Sandbox sandbox = 1`
-// field today (every member is server-chosen), but JSON transcoding accepts
-// the unwrapped form for forward-compatible callers. Keep `public_key` here
-// as a no-op compat shim so older `lakebox create --public-key-file=...`
-// invocations don't error — the manager ignores it on the wire.
+// `CreateSandboxRequest { Sandbox sandbox = 1 }` has `body: "*"`, so the
+// wire body is the full request with a `sandbox` wrapper.
 type createRequest struct {
-	PublicKey string `json:"public_key,omitempty"`
+	Sandbox sandboxCreateBody `json:"sandbox"`
 }
 
 // createResponse is the JSON body returned by POST /api/2.0/lakebox/sandboxes.
@@ -53,11 +57,14 @@ type createResponse struct {
 // form serializes Duration as a string with an `s` suffix (e.g.
 // `"900s"`), so the Go field is `*string` and we parse on read.
 type sandboxEntry struct {
-	SandboxID   string  `json:"sandboxId"`
-	Status      string  `json:"status"`
-	FQDN        string  `json:"fqdn"`
-	IdleTimeout *string `json:"idleTimeout,omitempty"`
-	NoAutostop  *bool   `json:"noAutostop,omitempty"`
+	SandboxID     string  `json:"sandboxId"`
+	Status        string  `json:"status"`
+	FQDN          string  `json:"fqdn"`
+	Name          string  `json:"name,omitempty"`
+	CreateTime    string  `json:"createTime,omitempty"`
+	LastStartTime string  `json:"lastStartTime,omitempty"`
+	IdleTimeout   *string `json:"idleTimeout,omitempty"`
+	NoAutostop    *bool   `json:"noAutostop,omitempty"`
 }
 
 // idleTimeoutSecs parses the proto3-canonical Duration string off
@@ -122,9 +129,16 @@ func formatDurationSecs(secs int64) string {
 }
 
 // listResponse is the JSON body returned by GET /api/2.0/lakebox/sandboxes.
+// `nextPageToken` is empty on the final page (or when the result fits in one).
 type listResponse struct {
-	Sandboxes []sandboxEntry `json:"sandboxes"`
+	Sandboxes     []sandboxEntry `json:"sandboxes"`
+	NextPageToken string         `json:"nextPageToken,omitempty"`
 }
+
+// listPageSize matches the manager-side default in `handlers::sandbox::list`.
+// Typical user fleets are well under this, so one round-trip covers them; the
+// pagination loop in `list` handles the rare larger fleet.
+const listPageSize = 100
 
 // apiError is the error body returned by the lakebox API.
 type apiError struct {
@@ -140,10 +154,11 @@ func newLakeboxAPI(w *databricks.WorkspaceClient) *lakeboxAPI {
 	return &lakeboxAPI{w: w}
 }
 
-// create calls POST /api/2.0/lakebox with an optional public key.
-func (a *lakeboxAPI) create(ctx context.Context, publicKey string) (*createResponse, error) {
-	body := createRequest{PublicKey: publicKey}
-	jsonBody, err := json.Marshal(body)
+// create calls POST /api/2.0/lakebox/sandboxes. An empty `name` is omitted
+// from the wire payload so the server treats it as "unset" rather than
+// "explicit empty string."
+func (a *lakeboxAPI) create(ctx context.Context, name string) (*createResponse, error) {
+	jsonBody, err := json.Marshal(createRequest{Sandbox: sandboxCreateBody{Name: name}})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -165,9 +180,34 @@ func (a *lakeboxAPI) create(ctx context.Context, publicKey string) (*createRespo
 	return &result, nil
 }
 
-// list calls GET /api/2.0/lakebox/sandboxes.
+// list calls GET /api/2.0/lakebox/sandboxes, following pagination until the
+// server stops sending `next_page_token`. Returns the full set in one slice.
 func (a *lakeboxAPI) list(ctx context.Context) ([]sandboxEntry, error) {
-	resp, err := a.doRequest(ctx, "GET", lakeboxAPIPath, nil)
+	var all []sandboxEntry
+	pageToken := ""
+	for {
+		page, err := a.listPage(ctx, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Sandboxes...)
+		if page.NextPageToken == "" {
+			return all, nil
+		}
+		pageToken = page.NextPageToken
+	}
+}
+
+// listPage fetches a single page of sandboxes. An empty `pageToken` requests
+// the first page; the server enforces ordering across pages.
+func (a *lakeboxAPI) listPage(ctx context.Context, pageToken string) (*listResponse, error) {
+	q := url.Values{}
+	q.Set("page_size", strconv.Itoa(listPageSize))
+	if pageToken != "" {
+		q.Set("page_token", pageToken)
+	}
+
+	resp, err := a.doRequest(ctx, "GET", lakeboxAPIPath+"?"+q.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +221,7 @@ func (a *lakeboxAPI) list(ctx context.Context) ([]sandboxEntry, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	return result.Sandboxes, nil
+	return &result, nil
 }
 
 // get calls GET /api/2.0/lakebox/sandboxes/{id}.
@@ -216,6 +256,7 @@ func (a *lakeboxAPI) get(ctx context.Context, id string) (*sandboxEntry, error) 
 // `google.protobuf.Duration`.
 type updateBody struct {
 	SandboxID   string  `json:"sandbox_id"`
+	Name        *string `json:"name,omitempty"`
 	IdleTimeout *string `json:"idle_timeout,omitempty"`
 	NoAutostop  *bool   `json:"no_autostop,omitempty"`
 }
@@ -227,6 +268,7 @@ type updateBody struct {
 func (a *lakeboxAPI) update(
 	ctx context.Context,
 	id string,
+	name *string,
 	idleTimeoutSecs *int64,
 	noAutostop *bool,
 ) (*sandboxEntry, error) {
@@ -237,6 +279,7 @@ func (a *lakeboxAPI) update(
 	}
 	body := updateBody{
 		SandboxID:   id,
+		Name:        name,
 		IdleTimeout: idleTimeout,
 		NoAutostop:  noAutostop,
 	}
@@ -293,7 +336,18 @@ func (a *lakeboxAPI) doRequest(ctx context.Context, method, path string, body io
 			wsid = v
 		}
 	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + path
+	// Callers may pass a leading query string (`...?page_token=...`) in `path`.
+	// Split it off so it lands in `RawQuery` rather than being URL-encoded into
+	// the path, and merge with the host's existing query (e.g. `?o=<wsid>`).
+	pathOnly, query, _ := strings.Cut(path, "?")
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + pathOnly
+	if query != "" {
+		if parsed.RawQuery == "" {
+			parsed.RawQuery = query
+		} else {
+			parsed.RawQuery = parsed.RawQuery + "&" + query
+		}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, method, parsed.String(), body)
 	if err != nil {
