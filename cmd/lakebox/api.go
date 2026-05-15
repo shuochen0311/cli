@@ -23,15 +23,18 @@ type lakeboxAPI struct {
 	w *databricks.WorkspaceClient
 }
 
+// sandboxCreateBody is the inner `Sandbox` message in the create payload.
+// Only `name` is caller-settable today (see `LakeboxApi::create_sandbox` in
+// `lakebox/src/api/service.rs`); all other fields are server-chosen.
+type sandboxCreateBody struct {
+	Name string `json:"name,omitempty"`
+}
+
 // createRequest is the JSON body for POST /api/2.0/lakebox/sandboxes.
-//
-// The proto-defined `CreateSandboxRequest` carries a `Sandbox sandbox = 1`
-// field today (every member is server-chosen), but JSON transcoding accepts
-// the unwrapped form for forward-compatible callers. Keep `public_key` here
-// as a no-op compat shim so older `lakebox create --public-key-file=...`
-// invocations don't error — the manager ignores it on the wire.
+// `CreateSandboxRequest { Sandbox sandbox = 1 }` has `body: "*"`, so the
+// wire body is the full request with a `sandbox` wrapper.
 type createRequest struct {
-	PublicKey string `json:"public_key,omitempty"`
+	Sandbox sandboxCreateBody `json:"sandbox"`
 }
 
 // createResponse is the JSON body returned by POST /api/2.0/lakebox/sandboxes.
@@ -53,11 +56,14 @@ type createResponse struct {
 // form serializes Duration as a string with an `s` suffix (e.g.
 // `"900s"`), so the Go field is `*string` and we parse on read.
 type sandboxEntry struct {
-	SandboxID   string  `json:"sandboxId"`
-	Status      string  `json:"status"`
-	FQDN        string  `json:"fqdn"`
-	IdleTimeout *string `json:"idleTimeout,omitempty"`
-	NoAutostop  *bool   `json:"noAutostop,omitempty"`
+	SandboxID     string  `json:"sandboxId"`
+	Status        string  `json:"status"`
+	FQDN          string  `json:"fqdn"`
+	Name          string  `json:"name,omitempty"`
+	CreateTime    string  `json:"createTime,omitempty"`
+	LastStartTime string  `json:"lastStartTime,omitempty"`
+	IdleTimeout   *string `json:"idleTimeout,omitempty"`
+	NoAutostop    *bool   `json:"noAutostop,omitempty"`
 }
 
 // idleTimeoutSecs parses the proto3-canonical Duration string off
@@ -140,10 +146,11 @@ func newLakeboxAPI(w *databricks.WorkspaceClient) *lakeboxAPI {
 	return &lakeboxAPI{w: w}
 }
 
-// create calls POST /api/2.0/lakebox with an optional public key.
-func (a *lakeboxAPI) create(ctx context.Context, publicKey string) (*createResponse, error) {
-	body := createRequest{PublicKey: publicKey}
-	jsonBody, err := json.Marshal(body)
+// create calls POST /api/2.0/lakebox/sandboxes. An empty `name` is omitted
+// from the wire payload so the server treats it as "unset" rather than
+// "explicit empty string."
+func (a *lakeboxAPI) create(ctx context.Context, name string) (*createResponse, error) {
+	jsonBody, err := json.Marshal(createRequest{Sandbox: sandboxCreateBody{Name: name}})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -216,6 +223,7 @@ func (a *lakeboxAPI) get(ctx context.Context, id string) (*sandboxEntry, error) 
 // `google.protobuf.Duration`.
 type updateBody struct {
 	SandboxID   string  `json:"sandbox_id"`
+	Name        *string `json:"name,omitempty"`
 	IdleTimeout *string `json:"idle_timeout,omitempty"`
 	NoAutostop  *bool   `json:"no_autostop,omitempty"`
 }
@@ -227,6 +235,7 @@ type updateBody struct {
 func (a *lakeboxAPI) update(
 	ctx context.Context,
 	id string,
+	name *string,
 	idleTimeoutSecs *int64,
 	noAutostop *bool,
 ) (*sandboxEntry, error) {
@@ -237,6 +246,7 @@ func (a *lakeboxAPI) update(
 	}
 	body := updateBody{
 		SandboxID:   id,
+		Name:        name,
 		IdleTimeout: idleTimeout,
 		NoAutostop:  noAutostop,
 	}
